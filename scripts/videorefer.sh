@@ -26,7 +26,7 @@ OUTPUT_DIR="outputs"
 #     LOG_FILE="$LOG_DIR/gpu_${GPULIST[$IDX]}.log"
     
 #     echo "launching taks on GPU ${GPULIST[$IDX]}... log file: $LOG_FILE"
-#     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} ASCEND_RT_VISIBLE_DEVICES=${GPULIST[$IDX]} python unipixel/eval/infer_videorefer_q.py \
+#     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} ASCEND_RT_VISIBLE_DEVICES=${GPULIST[$IDX]} python -u unipixel/eval/infer_videorefer_q.py \
 #         --dataset videorefer_bench_q \
 #         --split test \
 #         --model_path $ckpt_path \
@@ -84,12 +84,12 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     
     echo "launching taks on GPU ${GPULIST[$IDX]}... log file: $LOG_FILE"
 
-    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} ASCEND_RT_VISIBLE_DEVICES=${GPULIST[$IDX]} python unipixel/eval/infer_videorefer_d.py \
+    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} ASCEND_RT_VISIBLE_DEVICES=${GPULIST[$IDX]} python -u unipixel/eval/infer_videorefer_d.py \
         --dataset videorefer_bench_d \
         --split test \
         --model_path $ckpt_path \
-        --res_pred_path $OUTPUT_DIR/videorefer_bench_d \
-        --vis_pred_path $OUTPUT_DIR/videorefer_bench_d_vis \
+        --res_pred_path $OUTPUT_DIR/test_videorefer_bench_d \
+        --vis_pred_path $OUTPUT_DIR/test_videorefer_bench_d_vis \
         --chunk $CHUNKS \
         --index $IDX \
         --dump 100 \

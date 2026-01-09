@@ -8,7 +8,11 @@ __pycache__
 /data*
 /model_zoo
 /output*
+/logs*
 /wandb
 /work_dirs*
 .DS_Store
 ._*
+
+# Debugger
+.vscode/
