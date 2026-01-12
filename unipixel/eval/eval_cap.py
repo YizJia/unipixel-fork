@@ -149,8 +149,7 @@ def load_data(file_path):
         # Try to read the entire file as a single JSON object
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            if 'annotations' in data:
-                all_annotations.extend(data['annotations'])
+        return data
     except json.JSONDecodeError:
         # If that fails, try reading line by line as JSONL
         print("Warning: Could not parse file as a single JSON. Trying line by line...")
@@ -187,8 +186,8 @@ def calculate_metrics(annotations):
     res = {}
     
     for i, ann in enumerate(annotations):
-        if 'gt' in ann and 'pred' in ann:
-            gts[i] = [ann['gt']]
+        if 'caption' in ann and 'pred' in ann:
+            gts[i] = [ann['caption']]
             res[i] = [ann['pred']]
     
     # Calculate scores
@@ -211,10 +210,10 @@ def calculate_continuity_score(annotations):
     # Organize annotations by video ID
     videos = {}
     for ann in annotations:
-        video_id = ann.get('video_id', 'unknown')
+        video_id = ann.get('vid', 'unknown')
         if video_id not in videos:
             videos[video_id] = {'gt': [], 'pred': []}
-        videos[video_id]['gt'].append(ann.get('gt', ''))
+        videos[video_id]['gt'].append(ann.get('caption', ''))
         videos[video_id]['pred'].append(ann.get('pred', ''))
     
     # Calculate continuity score for each video
@@ -251,7 +250,7 @@ def evaluate(file_path, output_file=None, eval_continuity=False):
     annotations = load_data(file_path)
     
     # Check if there is enough data for evaluation
-    valid_annotations = [ann for ann in annotations if 'gt' in ann and 'pred' in ann]
+    valid_annotations = [ann for ann in annotations if 'caption' in ann and 'pred' in ann]
     if len(valid_annotations) == 0:
         print("No valid annotation data found (requires both gt and pred)")
         return

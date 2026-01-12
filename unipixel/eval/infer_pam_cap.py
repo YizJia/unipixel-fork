@@ -123,8 +123,7 @@ if __name__ == '__main__':
             anno['frames'],
             sample_frames=args.sample_frames,
             sample_type='uniform',
-            sample_for_llm_only=False,
-            num_threads=args.num_threads)
+            sample_for_llm_only=False)
 
         frame_size = frames.shape[1:3]
 
@@ -162,12 +161,12 @@ if __name__ == '__main__':
 
         point_coords, point_labels, point_frames = [], [], []
         
-        box_coords = torch.tensor(args['boxes'], dtype=torch.int32, device=device).view(1, 1, 4)
+        box_coords = torch.tensor(anno['boxes'], dtype=torch.int32, device=device).view(1, 1, 4)
         obj_point_coords = box_coords.reshape(-1, 2, 2)
         top_left_label = 2
         bottom_right_label = 3
         B = box_coords.shape[0]
-        obj_point_labels = torch.tensor([top_left_label, bottom_right_label], dtype=torch.int, device=device).repeat(B)
+        obj_point_labels = torch.tensor([top_left_label, bottom_right_label], dtype=torch.int, device=device).repeat(B).reshape(-1, 2)
 
         # assuming one object has only one point or box
         # point_coords: num_objs * num_points * 2
@@ -202,21 +201,16 @@ if __name__ == '__main__':
 
         # ====================================================================
 
-        question, ans = anno['question'], anno['ans']
-
-        masks = anno['single_frame_masks']
+        question, ans = anno['question'], anno['caption']
 
         print(len(anno['all_frame_inds']), anno['frame_idx'], anno['all_frame_inds'])
         print(question)
 
         frames, paths, inds = load_frames(
-            anno['video_path'],
-            anno['all_frame_inds'],
-            anno['frame_idx'],
+            anno['frames'],
             sample_frames=args.sample_frames,
             sample_type='uniform',
-            sample_for_llm_only=False,
-            num_threads=args.num_threads)
+            sample_for_llm_only=False)
 
         frame_size = frames.shape[1:3]
 
@@ -248,15 +242,9 @@ if __name__ == '__main__':
 
         prefix = f'Here is a video with {len(paths)} frames denoted as <1> to <{len(paths)}>. The highlighted regions are as follows:\n'
 
-        matches = re.findall(r'<object\d+><region>', prompt)
-        assert len(matches) == len(vids) > 0, prompt
-        for j, (match, tids) in enumerate(zip(matches, vids)):
-            # '<object0><region>' -> '0' '<object0>'
-            oid, obj = match[7:-9], match[:-8]
-            assert oid == str(int(oid)), match
-            assert oid == object_ids[j], (oid, object_ids, j)
-            prefix += f'[{oid}]: ' + ' '.join([f'<{tid}>-<{tid + 1}> ' + MEM_TOKEN for tid in tids]) + '\n'
-            prompt = prompt.replace(match, f'[{oid}]').replace(obj, f'[{oid}]')
+        assert len(vids) == 1
+        tids = vids[0]
+        prefix += '[0]: ' + ' '.join([f'<{tid}>-<{tid + 1}> ' + MEM_TOKEN for tid in tids]) + '\n'
 
         assert '<region>' not in prompt and '<object' not in prompt, prompt
 
@@ -280,7 +268,6 @@ if __name__ == '__main__':
         }]
 
         text = processor.apply_chat_template(messages, add_generation_prompt=True)
-        text += 'The best option is ('
 
         images, videos = process_vision_info(messages)
 
@@ -319,138 +306,7 @@ if __name__ == '__main__':
         response = processor.decode(output_ids, clean_up_tokenization_spaces=False)
         print(response)
 
-        dump['response'] = response
-
-        # dummy output mask
-        out_mask = cache_mask.transpose(0, 1)
-        assert out_mask.size(1) == len(inds)
-
-        masks = process_masks(dict(mask_type='rle', masks=anno['masks']), frame_size, inds)
-        ious, j_values, f_values, jf_values = [], [], [], []
-        for k in range(len(masks)):
-            mask = torch.stack(masks[k]).bool()
-            pred = out_mask[k].bool()
-            j_value, f_value, jf_value = compute_j_and_f_volume(pred, mask)
-            j_values.append(j_value)
-            f_values.append(f_value)
-            jf_values.append(jf_value)
-            assert mask.size() == pred.size(), (mask.size(), pred.size())
-            inter = (mask * pred).sum().item()
-            union = (mask + pred).sum().item()
-            iou = 1 if union == 0 else inter / union
-            ious.append(iou)
-        iou = sum(ious) / len(ious)
-        jf_value = sum(jf_values) / len(jf_values)
-
-        dump['iou'] = iou
-        dump['j_values'] = j_values
-        dump['f_values'] = f_values
-
-        if args.dump > 0 and i % args.dump == 0:
-            nncore.mkdir(args.vis_pred_path)
-            jpg_path = nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}.jpg")
-            gif_path = nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}.gif")
-
-            for obj_id in range(out_mask.size(0)):
-                point_coords[obj_id][:, :,
-                                     0] = point_coords[obj_id][:, :, 0] / model.config.sam2_image_size * frame_size[1]
-                point_coords[obj_id][:, :,
-                                     1] = point_coords[obj_id][:, :, 1] / model.config.sam2_image_size * frame_size[0]
-
-            plt.figure()
-            plt.title(' '.join(question.replace('<region>', '').split('\n')[:-1]).replace(' Options:', '\n'))
-            plt.imshow(Image.fromarray(frames[prompt_frame_idx].numpy()))
-            cmap = plt.get_cmap('tab10')
-            for obj_id in range(out_mask.size(0)):
-                if (point_labels[obj_id] == 1).all():
-                    plt.plot(
-                        point_coords[obj_id][0, 0, 0],
-                        point_coords[obj_id][0, 0, 1],
-                        marker='*',
-                        color=cmap(obj_id),
-                        markersize=15)
-                else:
-                    rect = Rectangle((point_coords[obj_id][0, 0, 0], point_coords[obj_id][0, 0, 1]),
-                                     point_coords[obj_id][0, 1, 0] - point_coords[obj_id][0, 0, 0],
-                                     point_coords[obj_id][0, 1, 1] - point_coords[obj_id][0, 0, 1],
-                                     linewidth=2,
-                                     edgecolor=cmap(obj_id),
-                                     facecolor='none')
-                    plt.gca().add_patch(rect)
-            plt.xticks([])
-            plt.yticks([])
-            plt.axis('off')
-            plt.tight_layout()
-            plt.savefig(jpg_path)
-            plt.close()
-
-            colors = [random_color(rgb=True, maximum=1) for _ in range(out_mask.size(0))]
-
-            visualizer = Visualizer(frames[prompt_frame_idx].numpy())
-            for obj_id in range(out_mask.size(0)):
-                if (point_labels[obj_id] == 1).all():
-                    visualizer.output.ax.plot(
-                        point_coords[obj_id][0, 0, 0],
-                        point_coords[obj_id][0, 0, 1],
-                        marker='*',
-                        color=colors[obj_id],
-                        markersize=40)
-                else:
-                    rect = Rectangle((point_coords[obj_id][0, 0, 0], point_coords[obj_id][0, 0, 1]),
-                                     point_coords[obj_id][0, 1, 0] - point_coords[obj_id][0, 0, 0],
-                                     point_coords[obj_id][0, 1, 1] - point_coords[obj_id][0, 0, 1],
-                                     linewidth=5,
-                                     edgecolor=colors[obj_id],
-                                     facecolor='none')
-                    visualizer.output.ax.add_patch(rect)
-
-            visualizer.output.save(
-                nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}_prompt.jpg"))
-
-            figs, imgs = [], []
-            for idx in range(len(inds)):
-                buffer = io.BytesIO()
-                visualizer = Visualizer(frames[idx].numpy())
-                for obj_id in range(out_mask.size(0)):
-                    fig = visualizer.draw_binary_mask_with_number(
-                        out_mask[obj_id, idx].bool().numpy(), color=colors[obj_id], alpha=0.3, anno_mode=['Mask'])
-                figs.append(fig)
-                fig.save(buffer)
-                buffer.seek(0)
-                imgs.append(iio.imread(buffer))
-
-            iio.imwrite(
-                nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}_{jf_value:.3f}.gif"),
-                imgs,
-                duration=100,
-                loop=0)
-
-            fig_inds = np.linspace(0, len(figs) - 1, 6, dtype=int)
-            images = []
-            for fig_idx in fig_inds:
-                buffer = io.BytesIO()
-                figs[fig_idx].save(buffer)
-                buffer.seek(0)
-                img = Image.open(buffer)
-                images.append(img.convert('RGB'))
-                buffer.close()
-
-            widths, heights = zip(*(img.size for img in images))
-            total_width = sum(widths)
-            max_height = max(heights)
-
-            new_img = Image.new('RGB', (total_width, max_height), color=(255, 255, 255))
-
-            x_offset = 0
-            for img in images:
-                new_img.paste(img, (x_offset, 0))
-                x_offset += img.width
-
-            new_img.save(
-                nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}_{jf_value:.3f}.jpg"))
-
-            nncore.dump(f'{question}\n{ans}\n{response}\n{fig_inds}\n{prompt_frame_idx}',
-                        nncore.join(args.vis_pred_path, f"{args.index}_{i}_{anno['vid'].replace('/', '_')}.txt"))
+        dump['pred'] = response
 
         dumps.append(dump)
 

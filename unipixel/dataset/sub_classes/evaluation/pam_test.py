@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Yizhen Jia.
 
 import re
+import json
 
 import nncore
 from torch.utils.data import Dataset
@@ -21,7 +22,12 @@ class PAMCaptionDataset(Dataset):
     def load_annos(self, split='test'):
         assert split == 'test'
 
-        raw_annos = nncore.load(self.ANNO_PATH)
+        # raw_annos = nncore.load(self.ANNO_PATH)
+        try:
+            with open(self.ANNO_PATH, "r") as f:
+                raw_annos = [json.loads(line) for line in f.readlines()]
+        except Exception as e:
+            print(f"Error reading {self.ANNO_PATH}: {e}")
 
         annos = []
         for raw_anno in raw_annos:
@@ -30,14 +36,16 @@ class PAMCaptionDataset(Dataset):
             image_root = raw_anno['image_root']
             frame_root = nncore.join(self.DATA_ROOT, image_root)
             vid = nncore.pure_name(image_root)
-            question = 'Please give a detailed description of the highlighted object [0] in the video.'
+            question = 'Please give a brief caption of the highlighted object [0] in the video in about 15 words.'
             oid = 0
-            mem_question = f'Please give a detailed description of the highlighted object [{oid}] {REF_TOKEN} in the video.'
+            mem_question = f'Please give a bried caption of the highlighted object [{oid}] {REF_TOKEN} in the video in about 15 words'
             mem_response = f'[{oid}] {SEG_TOKEN}'
 
 
             for event in raw_anno['annotations']:
                 frames = [nncore.join(frame_root, f) for f in event['frames']]
+                if len(frames) == 1:
+                    frames = frames * 2
                 obj_frame_inds = [sorted(range(len(frames)))]
                 all_frame_inds = sorted(list(set(nncore.flatten(obj_frame_inds))))
 

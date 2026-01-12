@@ -9,6 +9,7 @@ from .multimodal import MultimodalDataset
 from .referring import ReferringDataset
 from .region import RegionDataset
 from .segmentation import SegmentationDataset
+from .evaluation.pam_test import PAMCaptionDataset
 
 __all__ = [
     'MVBenchDataset',
@@ -21,4 +22,5 @@ __all__ = [
     'ReferringDataset',
     'RegionDataset',
     'SegmentationDataset',
+    'PAMCaptionDataset',
 ]

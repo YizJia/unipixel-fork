@@ -15,7 +15,7 @@ echo "log will be save in: $LOG_DIR"
 ckpt_path="model_zoo/UniPixel-3B"
 OUTPUT_DIR="outputs"
 
-ckpt_path=$1
+# ckpt_path=$1
 
 # ===========================================================================
 
@@ -28,12 +28,10 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     
     echo "launching taks on GPU ${GPULIST[$IDX]}... log file: $LOG_FILE"
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} ASCEND_RT_VISIBLE_DEVICES=${GPULIST[$IDX]} python -u unipixel/eval/infer_pam_cap.py \
-        --dataset pam_caption \
-        --split test \
+        --prompt_type box \
         --model_path $ckpt_path \
-        --res_pred_path $OUTPUT_DIR/videorefer_bench_q_single \
-        --vis_pred_path $OUTPUT_DIR/videorefer_bench_q_single_vis \
-        --single_frame_mode \
+        --res_pred_path $OUTPUT_DIR/pam_caption \
+        --vis_pred_path $OUTPUT_DIR/pam_caption_vis \
         --chunk $CHUNKS \
         --index $IDX \
         --dump 100 \
@@ -44,7 +42,7 @@ echo "All tasks are launched, waiting for completing..."
 wait
 echo "All tasks compledted!"
 
-python unipixel/eval/eval_cap.py $OUTPUT_DIR/videorefer_bench_q_single
+# python unipixel/eval/eval_cap.py --input $OUTPUT_DIR/pam_caption
 
 echo "All tasks are launched, waiting for completing..."
 wait
