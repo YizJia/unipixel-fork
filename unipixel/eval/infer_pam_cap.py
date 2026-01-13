@@ -35,6 +35,164 @@ SEG_MEMORY_PROMPTS = [
 ]
 
 
+class PseudoSinglePassCaptioner:
+    """Encapsulate "pseudo single-pass" captioning: segment then caption in one call."""
+
+    def __init__(self, model, processor, device=None):
+        self.model = model
+        self.processor = processor
+        if device is None:
+            device = next(model.parameters()).device
+        self.device = device
+        self.sam2_transform = get_sam2_transform(model.config.sam2_image_size)
+
+    def _run_mem_segmentation(self, anno, sample_frames, num_threads):
+        frames, paths, inds = load_frames(
+            anno['frames'],
+            sample_frames=sample_frames,
+            sample_type='uniform',
+            sample_for_llm_only=False)
+
+        frame_size = frames.shape[1:3]
+        prompt_frame_idx = inds.index(anno['all_frame_inds'].index(anno['frame_idx']))
+
+        question = SEG_MEMORY_PROMPTS[0].format(anno['mem_question'] + '.')
+        response = anno['mem_response']
+        object_ids = re.findall(r'\[(\d+)\]', response)
+
+        messages = [{
+            'role':
+            'user',
+            'content': [{
+                'type': 'video',
+                'video': paths,
+                'num_threads': num_threads,
+                'min_pixels': 128 * 28 * 28,
+                'max_pixels': 256 * 28 * 28 * int(sample_frames / len(paths))
+            }, {
+                'type': 'text',
+                'text': question
+            }]
+        }, {
+            'role': 'assistant',
+            'content': response
+        }]
+
+        point_coords, point_labels, point_frames = [], [], []
+        box_coords = torch.tensor(anno['boxes'], dtype=torch.int32, device=self.device).view(1, 1, 4)
+        obj_point_coords = box_coords.reshape(-1, 2, 2)
+        top_left_label = 2
+        bottom_right_label = 3
+        B = box_coords.shape[0]
+        obj_point_labels = torch.tensor([top_left_label, bottom_right_label], dtype=torch.int, device=self.device).repeat(B).reshape(-1, 2)
+
+        point_coords.append(obj_point_coords)
+        point_labels.append(obj_point_labels)
+        point_frames.append(prompt_frame_idx)
+        point_frames = [torch.LongTensor(point_frames)]
+
+        text = self.processor.apply_chat_template(messages)
+        images, videos = process_vision_info(messages)
+        data = self.processor(text=[text], images=images, videos=videos, return_tensors='pt').to(self.device)
+
+        data['frames'] = [self.sam2_transform(frames).to(dtype=self.model.sam2.dtype, device=self.device)]
+        data['frame_size'] = [frame_size]
+        data['point_coords'] = [[p.to(self.device) for p in point_coords]]
+        data['point_labels'] = [[p.to(self.device) for p in point_labels]]
+        data['point_frames'] = [[p.to(self.device) for p in point_frames]]
+
+        with torch.inference_mode():
+            self.model(**data)
+
+        assert self.model.seg[0].size(0) == 1
+        assert self.model.seg[0].size(1) == frames.size(0)
+
+        label_mask = torch.cat(self.model.seg[:len(object_ids)]).transpose(0, 1).float()
+        return label_mask, paths, frame_size
+
+    def _build_refer_mask_and_prompt(self, anno, label_mask, frame_size, sample_frames):
+        cache_mask = label_mask.clone()
+        refer_mask = label_mask.clone()
+        label_mask = T.resize(label_mask, (self.model.config.sam2_image_size, self.model.config.sam2_image_size))
+        label_mask = label_mask > 0
+
+        num_objs = refer_mask.size(1)
+        if refer_mask.size(0) % 2 != 0:
+            refer_mask = torch.cat((refer_mask, refer_mask[-1, None]))
+        refer_mask = refer_mask.flatten(1)
+        refer_mask = F.max_pool1d(refer_mask.transpose(-1, -2), kernel_size=2, stride=2).transpose(-1, -2)
+        refer_mask = refer_mask.view(-1, num_objs, *frame_size)
+
+        prompt = anno['question']
+        vids = []
+        for obj_idx in range(num_objs):
+            if (refer_mask[:, obj_idx] == 0).all():
+                refer_mask[:, obj_idx] = 1
+            tids = (refer_mask[:, obj_idx].any(dim=(-1, -2)).nonzero()[:, 0] * 2 + 1).tolist()
+            vids.append(tids)
+
+        prefix = f'Here is a video with {len(anno["frames"])} frames denoted as <1> to <{len(anno["frames"])}>. The highlighted regions are as follows:\n'
+        assert len(vids) == 1
+        tids = vids[0]
+        prefix += '[0]: ' + ' '.join([f'<{tid}>-<{tid + 1}> ' + MEM_TOKEN for tid in tids]) + '\n'
+        assert '<region>' not in prompt and '<object' not in prompt, prompt
+        prompt = prefix + prompt
+
+        return refer_mask, prompt, cache_mask, label_mask
+
+    def caption(self, anno, sample_frames=16, num_threads=0, max_new_tokens=512):
+        label_mask, paths, frame_size = self._run_mem_segmentation(anno, sample_frames, num_threads)
+        refer_mask, prompt, _, _ = self._build_refer_mask_and_prompt(anno, label_mask, frame_size, sample_frames)
+
+        messages = [{
+            'role':
+            'user',
+            'content': [{
+                'type': 'video',
+                'video': paths,
+                'num_threads': num_threads,
+                'min_pixels': 128 * 28 * 28,
+                'max_pixels': 256 * 28 * 28 * int(sample_frames / len(paths))
+            }, {
+                'type': 'text',
+                'text': prompt
+            }]
+        }]
+
+        text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+        images, videos = process_vision_info(messages)
+        data = self.processor(text=[text], images=images, videos=videos, return_tensors='pt').to(self.device)
+
+        refer_mask = T.resize(refer_mask, (data['video_grid_thw'][0][1] * 14, data['video_grid_thw'][0][2] * 14))
+        refer_mask = F.max_pool2d(refer_mask, kernel_size=28, stride=28)
+        refer_mask = refer_mask > 0
+
+        if not refer_mask.any():
+            print('[WARNING] refer mask is empty')
+
+        assert refer_mask.size(0) == data['video_grid_thw'][0][0]
+        assert refer_mask.size(2) == data['video_grid_thw'][0][1] // 2
+        assert refer_mask.size(3) == data['video_grid_thw'][0][2] // 2
+
+        data['refer_mask'] = [refer_mask.to(self.device)]
+
+        output_ids = self.model.generate(
+            **data,
+            do_sample=False,
+            temperature=None,
+            top_k=None,
+            top_p=None,
+            repetition_penalty=None,
+            max_new_tokens=max_new_tokens)
+
+        assert data.input_ids.size(0) == output_ids.size(0) == 1
+        output_ids = output_ids[0, data.input_ids.size(1):]
+        if output_ids[-1] == self.processor.tokenizer.eos_token_id:
+            output_ids = output_ids[:-1]
+
+        return self.processor.decode(output_ids, clean_up_tokenization_spaces=False)
+
+
 def compute_iou_volume(pred: torch.Tensor, gt: torch.Tensor):
     pred_flat = pred.view(-1)
     gt_flat = gt.view(-1)

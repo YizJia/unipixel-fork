@@ -4,6 +4,8 @@ import random
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms.functional as T
 from hydra import compose
 from hydra.utils import instantiate
 from nncore.nn import constant_init_, xavier_init_
@@ -367,6 +369,141 @@ class PixelQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
 
         return outputs
 
+    @torch.no_grad()
+    def _run_segmentation(self, seg_token, frames, frame_size):
+        # Minimal SAM2 inference wrapper for streaming decode.
+        if self.config.sam2_batch_mode:
+            pred_mask = []
+            for idx in range(frames.size(0)):
+                state = self.sam2.init_state(frames[idx, None], frame_size)
+                self.sam2.add_new_hidden_state(state, 0, 0, seg_token)
+                pred_mask += [o[2] for o in self.sam2.propagate_in_video(state, verbose=False)]
+            pred_mask = torch.cat(pred_mask, dim=1)
+        else:
+            state = self.sam2.init_state(frames, frame_size)
+            self.sam2.add_new_hidden_state(state, 0, 0, seg_token)
+            pred_mask = torch.cat([o[2] for o in self.sam2.propagate_in_video(state, verbose=False)], dim=1)
+
+        return pred_mask > 0
+
+    @torch.no_grad()
+    def _build_refer_mask(self, pred_mask, video_grid_thw):
+        # Map frame-size mask to token grid (spatial merge size=2, patch size=14).
+        refer_mask = pred_mask.float()
+        refer_mask = T.resize(refer_mask, (video_grid_thw[1] * 14, video_grid_thw[2] * 14))
+        refer_mask = F.max_pool2d(refer_mask, kernel_size=28, stride=28)
+        refer_mask = refer_mask > 0
+        return refer_mask
+
+    @torch.no_grad()
+    def _build_mem_embedding(self, refer_mask, video_grid_thw):
+        # Build memory embeddings from refer_mask and cached visual states.
+        mem, base_idx = [], 0
+        size = video_grid_thw.prod().item() // 4
+        step = video_grid_thw[1] * video_grid_thw[2] // 4
+
+        emb = self.model.visual.merger.mlp.state[base_idx:base_idx + size]
+        for obj_idx in range(refer_mask.size(1)):
+            mask = refer_mask[:, obj_idx].flatten()
+            assert mask.size(0) == emb.size(0) == size
+            obj_emb = []
+            for i in range(0, size, step):
+                frame_mask = mask[i:i + step]
+                if frame_mask.any():
+                    obj_emb.append(emb[i:i + step][frame_mask].mean(dim=0))
+            if len(obj_emb) > 0:
+                mem.append(torch.stack(obj_emb))
+
+        if len(mem) == 0:
+            return None
+
+        return self.msk_proj(torch.cat(mem))
+
+    @torch.no_grad()
+    def stream_generate(self, inputs, frames, frame_size, max_new_tokens=512):
+        """
+        Minimal streaming decode skeleton:
+        - Run prefill to get cache.
+        - Decode token-by-token.
+        - When <seg> appears, run SAM2 and build refer_mask/mem embedding.
+        """
+        input_ids = inputs['input_ids']
+        attention_mask = inputs.get('attention_mask', None)
+        pixel_values = inputs.get('pixel_values', None)
+        pixel_values_videos = inputs.get('pixel_values_videos', None)
+        image_grid_thw = inputs.get('image_grid_thw', None)
+        video_grid_thw = inputs.get('video_grid_thw', None)
+
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            frames=frames,
+            frame_size=frame_size,
+            use_cache=True,
+            return_dict=True)
+
+        past_key_values = outputs.past_key_values
+        generated = [input_ids]
+        pending_refer_mask = None
+        mem_emb_queue = None
+
+        for _ in range(max_new_tokens):
+            if mem_emb_queue is not None and mem_emb_queue.numel() > 0:
+                next_token = torch.full((1, 1), self.config.mem_token_id, device=input_ids.device, dtype=input_ids.dtype)
+                next_inputs_embeds = mem_emb_queue[:1].to(input_ids.device)
+                next_inputs_embeds = next_inputs_embeds.unsqueeze(0)
+                mem_emb_queue = mem_emb_queue[1:]
+            else:
+                next_token = outputs.logits[:, -1].argmax(dim=-1, keepdim=True)
+                next_inputs_embeds = None
+
+            if next_token.item() == self.config.seg_token_id:
+                seg_token = self.seg_head(self.model.language_model.norm.state)[:, -1, None]
+                pred_mask = self._run_segmentation(seg_token, frames[0], frame_size[0])
+                pending_refer_mask = self._build_refer_mask(pred_mask, video_grid_thw[0])
+                mem_emb = self._build_mem_embedding(pending_refer_mask, video_grid_thw[0])
+                if mem_emb is not None:
+                    mem_emb_queue = mem_emb
+
+            generated.append(next_token)
+
+            outputs = self.forward(
+                input_ids=next_token,
+                attention_mask=None,
+                past_key_values=past_key_values,
+                inputs_embeds=next_inputs_embeds,
+                pixel_values=None,
+                pixel_values_videos=None,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                refer_mask=[pending_refer_mask] if pending_refer_mask is not None else None,
+                use_cache=True,
+                return_dict=True)
+
+            past_key_values = outputs.past_key_values
+
+            if next_token.item() == self.config.eos_token_id:
+                break
+
+        return torch.cat(generated, dim=1)
+
+    @torch.no_grad()
+    def generate_stream(self, max_new_tokens=512, **data):
+        """
+        Public streaming API that mirrors generate-style inputs.
+        Expects `frames` and `frame_size` in data.
+        """
+        frames = data.pop('frames', None)
+        frame_size = data.pop('frame_size', None)
+        if frames is None or frame_size is None:
+            raise ValueError('generate_stream requires `frames` and `frame_size` for SAM2.')
+
+        return self.stream_generate(data, frames, frame_size, max_new_tokens=max_new_tokens)
+
     def prepare_inputs_for_generation(self,
                                       *args,
                                       cache_position=None,
@@ -376,6 +513,7 @@ class PixelQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
                                       point_labels=None,
                                       point_frames=None,
                                       refer_mask=None,
+                                      allow_refer_mask_update=False,
                                       **kwargs):
         model_inputs = super().prepare_inputs_for_generation(*args, cache_position=cache_position, **kwargs)
 
@@ -385,7 +523,7 @@ class PixelQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
             'point_coords': point_coords if cache_position[0] == 0 else None,
             'point_labels': point_labels if cache_position[0] == 0 else None,
             'point_frames': point_frames if cache_position[0] == 0 else None,
-            'refer_mask': refer_mask if cache_position[0] == 0 else None
+            'refer_mask': refer_mask if (cache_position[0] == 0 or allow_refer_mask_update) else None
         })
 
         return model_inputs
